@@ -59,7 +59,6 @@ ignore = ["B008", "D105", "D107"]
 known-first-party = ["inspect_robots", "inspect_robots_dream"]
 
 [tool.mypy]
-python_version = "3.11"
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
