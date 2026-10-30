@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inspect-robots-dream"
+version = "0.1.0"
+description = "Inspect Robots policy that runs Dream Labs' Dream-1 on the bimanual YAM, through a local bridge"
+requires-python = ">=3.10"
+# The policy runs inside the Isaac env (inspect-robots, inspect-robots-yam, NumPy and Isaac Sim's own cv2 are
+# already there); the bridge runs in a separate venv with `dreamlabs`. Install with --no-deps into the Isaac env.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+bridge = ["dreamlabs>=1.0.23"]
+
+[project.entry-points."inspect_robots.policies"]
+dream = "inspect_robots_dream.policy:dream_policy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inspect_robots_dream"]
