@@ -1,21 +1,79 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [project]
 name = "inspect-robots-dream"
 version = "0.1.0"
-description = "Inspect Robots policy that runs Dream Labs' Dream-1 on the bimanual YAM, through a local bridge"
-requires-python = ">=3.10"
-# The policy runs inside the Isaac env (inspect-robots, inspect-robots-yam, NumPy and Isaac Sim's own cv2 are
-# already there); the bridge runs in a separate venv with `dreamlabs`. Install with --no-deps into the Isaac env.
-dependencies = ["numpy"]
+description = "Dream Labs' Dream-1 as an Inspect Robots policy for the bimanual YAM."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "inspect-robots-dream contributors" }]
+keywords = ["robotics", "vla", "dream-1", "yam", "inspect-robots", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# The Dream client is an extra: Isaac Sim pins websockets 12 and the client needs 13 or newer, so under
+# Isaac Sim the client runs in its own venv as `inspect-robots-dream-bridge`.
+dependencies = ["inspect-robots>=0.60", "numpy>=1.24", "pillow>=10"]
 
 [project.optional-dependencies]
-bridge = ["dreamlabs>=1.0.23"]
+client = ["dreamlabs-client>=1.0.14"]
+dev = ["inspect-robots-dream[client]", "pytest>=8.0", "pytest-cov>=5.0", "mypy>=1.11", "ruff>=0.6"]
+
+[project.scripts]
+inspect-robots-dream-bridge = "inspect_robots_dream.bridge:main"
 
 [project.entry-points."inspect_robots.policies"]
-dream = "inspect_robots_dream.policy:dream_policy"
+dream = "inspect_robots_dream:dream_policy"
+
+[project.urls]
+Repository = "https://github.com/kairosiann/inspect-robots-dream"
+Issues = "https://github.com/kairosiann/inspect-robots-dream/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/inspect_robots_dream"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF", "D1"]
+ignore = ["B008", "D105", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["inspect_robots", "inspect_robots_dream"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["inspect_robots_dream"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_also = ["if __name__ == .__main__.:", ": \\.\\.\\.$"]

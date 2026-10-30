@@ -1,315 +1,241 @@
-"""Local HTTP bridge to Dream-1: runs `dream.DreamClient` in its own venv and serves it to the Isaac process.
+"""Serve the Dream client to the ``dream`` policy over loopback HTTP, from its own environment.
 
-The Dream library needs NumPy 2 and websockets 17 while Isaac Sim 5.1 pins NumPy 1.26 and websockets 12, so the
-client cannot live in the Isaac env. This bridge holds one client and one policy session; the `dream` policy in
-the Isaac process talks to it over loopback JSON:
+Isaac Sim 5.1 pins websockets 12 and the Dream client needs 13 or newer, so under Isaac Sim the
+client runs in a separate venv as this bridge::
 
-    GET  /health    model, versions, whether a session is open
-    POST /reset     {"prompt", "action_hz"}: open the policy (or reset_episode()) for a new trial
-    POST /observe   {"frames": {camera: b64 jpeg}, "state": [14], "timestamp"}: one set_observation()
-    POST /act       {"commanded": [14] | null}: one get_action(); returns q_l_chunk / q_r_chunk
+    inspect-robots-dream-bridge --warm                      # in the Dream venv
+    inspect-robots run --policy dream -P server_url=http://127.0.0.1:8210 ...
 
-Run it in the Dream venv (`--warm` sends one synthetic request first and waits while the model starts):
-
-    /data/dream/venv/bin/python -m inspect_robots_dream.bridge --warm
-
-Simulated episodes are not recorded to the Dream account (`_record: False`, as Dream's own sim example does);
-`--record` turns recording on. Only stdlib + NumPy at import; `dream` is imported when the bridge starts.
+JSON in and out: ``POST /check`` and ``POST /start`` (an episode), ``POST /observe`` (one tick),
+``POST /act`` (one chunk) and ``GET /health``. Requests reach the Dream client one at a time, and
+only the episode that started last may observe or act. The bridge has no authentication, so it
+listens on loopback unless told otherwise.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
+import http.client
 import json
-import sys
-import time
-from collections.abc import Callable, Mapping
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+import threading
+import urllib.error
+import urllib.request
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import closing, suppress
+from dataclasses import asdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, cast
 
 import numpy as np
 
-from inspect_robots_dream import wire
+from inspect_robots_dream import _station
+from inspect_robots_dream._station import Vector
+from inspect_robots_dream.session import (
+    DEFAULT_MODEL,
+    REQUEST_TIMEOUT_S,
+    Chunk,
+    DreamSession,
+    Episode,
+    Session,
+)
 
-DEFAULT_MODEL = "dreamlabs/dream-1-beta"
 DEFAULT_PORT = 8210
-# Errors worth asking again for, besides any DreamServerError the client marks `retryable`.
-_RETRY_TYPES = frozenset({"DreamSessionExpired", "DreamTimeout"})
+
+_Post = Callable[[str, Mapping[str, Any], float], dict[str, Any]]
+_Route = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-class BridgeError(Exception):
-    """A request the bridge cannot serve; `status` is the HTTP status it answers with."""
-
-    def __init__(self, message: str, status: int = 400, **detail: Any) -> None:
-        super().__init__(message)
-        self.status = status
-        self.detail = detail
+class BridgeError(RuntimeError):
+    """The bridge answered, but refused the request."""
 
 
-class Bridge:
-    """One Dream client and its policy session, driven one request at a time.
+class BridgeSession:
+    """A `Session` whose Dream client runs in a bridge process at ``url``.
 
-    `client_factory()` returns a `dream.DreamClient`-like object; `sleep` and `clock` are injectable for tests.
+    A bridge that does not answer raises `ConnectionError`; one that refuses raises `BridgeError`.
     """
 
-    def __init__(
-        self,
-        client_factory: Callable[[], Any],
-        *,
-        model: str = DEFAULT_MODEL,
-        timeout_ms: int = 45000,
-        record: bool = False,
-        retry_budget_s: float = 120.0,
-        sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
-        log: Callable[[dict[str, Any]], None] | None = None,
+    def __init__(self, url: str, *, post: _Post | None = None) -> None:
+        self.url = url.rstrip("/")
+        self._post = post or _post
+        self._timeout_s = Episode.timeout_s
+        self._episode = ""
+
+    def check(self, episode: Episode) -> None:
+        """Raise now if the bridge is down or cannot run ``episode``."""
+        self._call("check", asdict(episode), 60.0)
+
+    def start(self, episode: Episode) -> None:
+        """Begin ``episode`` on the bridge's Dream client; it then belongs to this session."""
+        self._timeout_s = episode.timeout_s
+        self._episode = self._call("start", asdict(episode), 60.0)["episode"]
+
+    def observe(
+        self, frames: Mapping[str, str], state: Vector, prompt: str, timestamp: float
     ) -> None:
-        self._client_factory = client_factory
-        self._client: Any = None
-        self.model = model
-        self.timeout_ms = timeout_ms
-        self.record = record
-        self.retry_budget_s = retry_budget_s
-        self._sleep = sleep
-        self._clock = clock
-        self._log = log or (lambda entry: None)
-        self._action_hz: float | None = None
-        self._prompt = ""
-        self.calls = 0
-
-    def _config(self, action_hz: float) -> dict[str, Any]:
-        # Station keys carry no strict-mode embodiment, so strict is off; the policy validates every reply itself.
-        return {
-            "checkpoint": self.model,
-            "timeout_ms": self.timeout_ms,
-            "strict": False,
-            "action_hz": action_hz,
-            "obs_window": wire.OBS_WINDOW,
-            "obs_fps": wire.OBS_FPS,
-            "_record": self.record,
+        """Pass one tick through the bridge to Dream."""
+        tick = {
+            "frames": dict(frames),
+            "state": state.tolist(),
+            "prompt": prompt,
+            "timestamp": timestamp,
         }
+        self._call("observe", tick, 30.0)
 
-    def health(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "model": self.model,
-            "session_open": self._action_hz is not None,
-            "action_hz": self._action_hz,
-            "record": self.record,
-            "calls": self.calls,
-        }
-
-    def reset(self, prompt: str, action_hz: float) -> dict[str, Any]:
-        """Start a trial: (re)open the policy when the row rate changed or none is open, else end the episode."""
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise BridgeError("reset needs a non-empty prompt")
-        if not isinstance(action_hz, (int, float)) or isinstance(action_hz, bool) or not action_hz > 0:
-            raise BridgeError(f"reset needs a positive action_hz, got {action_hz!r}")
-        if self._client is None:
-            self._client = self._client_factory()
-        if self._action_hz != float(action_hz):
-            self._client.policy(self._config(float(action_hz)))
-            self._action_hz = float(action_hz)
-        else:
-            self._client.reset_episode()
-        self._prompt = prompt
-        return {"ok": True, "model": self.model, "action_hz": self._action_hz}
-
-    def observe(self, frames: Mapping[str, str], state: Any, timestamp: float) -> dict[str, Any]:
-        """Hand the client one tick: three JPEG frames and the 14-D measured state, at `timestamp` seconds."""
-        if self._client is None or self._action_hz is None:
-            raise BridgeError("observe before reset")
-        try:
-            keyed = wire.station_frames(frames)
-            obs = wire.station_observation(state, self._prompt)
-        except ValueError as error:
-            raise BridgeError(str(error)) from None
-        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool) or not np.isfinite(timestamp):
-            raise BridgeError(f"timestamp must be a finite number, got {timestamp!r}")
-        self._client.set_observation(keyed, obs, timestamp=float(timestamp))
-        return {"ok": True}
-
-    def act(self, commanded: Any = None) -> dict[str, Any]:
-        """One get_action(), asked again for retryable refusals within `retry_budget_s`; returns both chunks."""
-        if self._client is None or self._action_hz is None:
-            raise BridgeError("act before reset")
-        last = None if commanded is None else wire.commanded(commanded)
-        started = self._clock()
-        attempts = 0
-        while True:
-            attempts += 1
-            sent = self._clock()
-            try:
-                reply = self._client.get_action(commanded=last)
-                break
-            except Exception as error:  # duck-typed: the dream error types live only in the Dream venv
-                name = type(error).__name__
-                retryable = name in _RETRY_TYPES or bool(getattr(error, "retryable", False))
-                waited = self._clock() - started
-                if not retryable or waited >= self.retry_budget_s:
-                    self._log({"event": "act_error", "error": name, "message": str(error), "attempts": attempts})
-                    raise BridgeError(
-                        f"{name}: {error}",
-                        status=502,
-                        error=name,
-                        code=getattr(error, "code", None),
-                        reason=getattr(error, "reason", None),
-                        retryable=retryable,
-                    ) from None
-                pause = getattr(error, "retry_after_s", None) or 1.0
-                if name == "DreamSessionExpired":
-                    pause = 0.0
-                self._log({"event": "act_retry", "error": name, "reason": getattr(error, "reason", None), "pause_s": pause})
-                print(f"dream bridge: {name} {getattr(error, 'reason', '') or ''}, retrying in {pause:.0f}s", flush=True)
-                self._sleep(min(pause, max(self.retry_budget_s - waited, 0.0)))
-        rtt_s = self._clock() - sent
-        self.calls += 1
-        out: dict[str, Any] = {key: np.asarray(reply[key]).tolist() for key in wire.CHUNK_KEYS if key in reply}
-        out["keys"] = sorted(reply)
-        out["rtt_s"] = rtt_s
-        out["attempts"] = attempts
-        out["timing"] = _jsonable(getattr(self._client, "last_timing", None))
-        out["session_id"] = getattr(self._client, "session_id", None)
-        self._log({k: out[k] for k in ("rtt_s", "attempts", "timing", "session_id", "keys")} | {"event": "act"})
-        return out
+    def act(self, commanded: Vector | None) -> Chunk:
+        """The bridge's next chunk, waiting as long as the bridge may keep retrying Dream."""
+        payload = {"commanded": None if commanded is None else commanded.tolist()}
+        wait_s = self._timeout_s + REQUEST_TIMEOUT_S + 15.0
+        return Chunk.from_json(self._call("act", payload, wait_s))
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-        self._client = None
-        self._action_hz = None
+        """Nothing to release here: the bridge owns the Dream session."""
+
+    def _call(self, route: str, payload: Mapping[str, Any], timeout_s: float) -> dict[str, Any]:
+        body = {**payload, "episode": self._episode} if route in ("observe", "act") else payload
+        return self._post(f"{self.url}/{route}", body, timeout_s)
 
 
-def _jsonable(value: Any) -> Any:
-    """A JSON-safe copy of a timing dict (NumPy scalars become floats); None stays None."""
-    if value is None:
-        return None
-    return json.loads(json.dumps(value, default=lambda v: np.asarray(v).tolist()))
-
-
-def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
-    """A request handler serving `bridge`; the single-threaded server keeps to one Dream call at a time."""
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - the stdlib's name
-            pass  # one line per tick would drown the terminal; the JSONL log has the Dream calls
-
-        def _send(self, status: int, body: Mapping[str, Any]) -> None:
-            data = json.dumps(body).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
-            if self.path == "/health":
-                self._send(200, bridge.health())
-            else:
-                self._send(404, {"error": "NotFound", "message": self.path})
-
-        def do_POST(self) -> None:  # noqa: N802 - the stdlib's name
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}")
-                if not isinstance(body, dict):
-                    raise BridgeError("request body must be a JSON object")
-                if self.path == "/reset":
-                    result = bridge.reset(body.get("prompt", ""), body.get("action_hz"))
-                elif self.path == "/observe":
-                    result = bridge.observe(body.get("frames") or {}, body.get("state"), body.get("timestamp"))
-                elif self.path == "/act":
-                    result = bridge.act(body.get("commanded"))
-                else:
-                    self._send(404, {"error": "NotFound", "message": self.path})
-                    return
-                self._send(200, result)
-            except BridgeError as error:
-                self._send(error.status, {"error": "BridgeError", "message": str(error), **error.detail})
-            except (json.JSONDecodeError, ValueError) as error:
-                self._send(400, {"error": type(error).__name__, "message": str(error)})
-            except Exception as error:  # a Dream config/observation error: report it rather than drop the socket
-                self._send(500, {"error": type(error).__name__, "message": str(error)})
-
-    return Handler
-
-
-def _black_jpeg() -> str:  # pragma: no cover - needs cv2, only in the warm-up
-    import cv2
-
-    width, height = wire.FRAME_SIZE
-    ok, buf = cv2.imencode(".jpg", np.zeros((height, width, 3), np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not ok:
-        raise RuntimeError("could not encode the warm-up frame")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
-
-
-def warm(bridge: Bridge, max_wait_s: float) -> dict[str, Any]:
-    """Send one synthetic request (black frames, home pose) so a stopped model starts; discard the reply."""
-    frame = _black_jpeg()
-    home = [0.0] * wire.ARM_DOF + [1.0]
-    budget, bridge.retry_budget_s = bridge.retry_budget_s, max_wait_s
+def _post(url: str, payload: Mapping[str, Any], timeout_s: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
+    )
     try:
-        bridge.reset("hold still", wire.STATION_HZ)
-        bridge.observe(dict.fromkeys(wire.FRAME_KEYS, frame), home + home, 0.0)
-        return bridge.act()
-    finally:
-        bridge.retry_budget_s = budget
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read())
+        except (OSError, ValueError):
+            detail = {}
+        message = f"{detail.get('error', error.code)}: {detail.get('message', error.reason)}"
+        raise BridgeError(message) from None
+    except (OSError, http.client.HTTPException) as error:
+        reason = getattr(error, "reason", None) or error
+        raise ConnectionError(f"no Dream bridge answering at {url}: {reason}") from error
+    try:
+        body: dict[str, Any] = json.loads(raw)
+    except ValueError:
+        raise BridgeError(f"{url} did not answer with JSON") from None
+    return body
 
 
-def main(argv: list[str] | None = None) -> int:  # pragma: no cover - process entry point
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="checkpoint id (DreamClient().get_models() lists them)")
+class BridgeServer(ThreadingHTTPServer):
+    """One `Session` served over HTTP, one Dream call at a time."""
+
+    def __init__(self, session: Session, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> None:
+        super().__init__((host, port), _Handler)
+        self.lock = threading.Lock()
+        self.routes = _routes(session)
+
+
+def _routes(session: Session) -> dict[str, _Route]:
+    current = ""
+
+    def check(body: dict[str, Any]) -> dict[str, Any]:
+        session.check(Episode(**body))
+        return {}
+
+    def start(body: dict[str, Any]) -> dict[str, Any]:
+        nonlocal current
+        session.start(Episode(**body))
+        current = uuid.uuid4().hex
+        return {"episode": current}
+
+    def observe(body: dict[str, Any]) -> dict[str, Any]:
+        _own(body, current)
+        frames, prompt = body["frames"], body["prompt"]
+        if not isinstance(frames, dict) or not isinstance(prompt, str):
+            raise TypeError("observe takes a frames object and a prompt string")
+        session.observe(frames, _station.vector(body["state"]), prompt, float(body["timestamp"]))
+        return {}
+
+    def act(body: dict[str, Any]) -> dict[str, Any]:
+        _own(body, current)
+        commanded = body["commanded"]
+        return session.act(None if commanded is None else _station.vector(commanded)).to_json()
+
+    return {"/check": check, "/start": start, "/observe": observe, "/act": act}
+
+
+def _own(body: Mapping[str, Any], current: str) -> None:
+    if not current or body.get("episode") != current:
+        raise RuntimeError("this episode is not the one the bridge is running: start it again")
+
+
+class _Handler(BaseHTTPRequestHandler):
+    timeout = 30.0
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self._reply(200, {"ok": True})
+        else:
+            self._reply(404, {"error": "NotFound", "message": self.path})
+
+    def do_POST(self) -> None:
+        server = cast(BridgeServer, self.server)
+        route = server.routes.get(self.path)
+        if route is None:
+            self._reply(404, {"error": "NotFound", "message": self.path})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise TypeError("the request body must be a JSON object")
+            with server.lock:
+                reply = route(body)
+        except Exception as error:
+            self._reply(500, {"error": type(error).__name__, "message": str(error)})
+        else:
+            self._reply(200, reply)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Stay quiet: a line per tick would bury the retries the session reports."""
+
+    def _reply(self, status: int, body: Mapping[str, Any]) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _warm(session: Session, model: str, timeout_s: float) -> Chunk:
+    """Ask ``model`` for one chunk on a still scene, so a stopped model starts before a run."""
+    black = _station.jpeg(np.zeros((_station.FRAME_HEIGHT, _station.FRAME_WIDTH, 3), np.uint8))
+    home = np.tile([0.0] * _station.ARM_JOINTS + [1.0], 2)
+    session.start(Episode(model=model, timeout_s=timeout_s))
+    session.observe(dict.fromkeys(_station.CAMERAS, black), home, "hold still", 0.0)
+    return session.act(None)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``inspect-robots-dream-bridge``: serve a `DreamSession` until interrupted."""
+    parser = argparse.ArgumentParser(
+        prog="inspect-robots-dream-bridge",
+        description="Serve the Dream client to the inspect-robots dream policy over HTTP.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--timeout-ms", type=int, default=45000)
-    parser.add_argument("--retry-budget-s", type=float, default=120.0, help="how long one /act retries refusals")
-    parser.add_argument("--record", action="store_true", help="record episodes to the Dream account (off for sim)")
-    parser.add_argument("--warm", action="store_true", help="start the model with one synthetic request first")
-    parser.add_argument("--warm-max-s", type=float, default=3600.0)
-    parser.add_argument("--log", default=None, help="append one JSON line per Dream call to this file")
+    parser.add_argument("--warm", action="store_true", help="start the model before serving")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="the checkpoint --warm starts")
+    parser.add_argument("--warm-timeout-s", type=float, default=3600.0)
     args = parser.parse_args(argv)
 
-    import dream
-
-    log_file = open(args.log, "a") if args.log else None  # noqa: SIM115 - lives as long as the server
-
-    def log(entry: dict[str, Any]) -> None:
-        if log_file is not None:
-            log_file.write(json.dumps({"wall_s": time.time(), **entry}) + "\n")
-            log_file.flush()
-
-    models = {m.id: m for m in dream.DreamClient().get_models()}
-    if args.model not in models:
-        print(f"dream bridge: {args.model!r} is not a model this key may run: {sorted(models)}", file=sys.stderr)
-        return 2
-    bridge = Bridge(
-        dream.DreamClient,
-        model=args.model,
-        timeout_ms=args.timeout_ms,
-        record=args.record,
-        retry_budget_s=args.retry_budget_s,
-        log=log,
-    )
-    print(f"dream bridge: dream {dream.__version__}, model {args.model}, recording {'on' if args.record else 'off'}")
-    if args.warm:
-        print("dream bridge: warming the model (a stopped model can take a while to start)...", flush=True)
-        reply = warm(bridge, args.warm_max_s)
-        print(f"dream bridge: model answered in {reply['rtt_s']:.2f}s", flush=True)
-    server = HTTPServer((args.host, args.port), make_handler(bridge))
-    print(f"dream bridge: listening on http://{args.host}:{args.port}", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        bridge.close()
-        if log_file is not None:
-            log_file.close()
+    session = DreamSession()
+    with closing(session):
+        if args.warm:
+            print(f"Starting {args.model}; a stopped model can take many minutes.", flush=True)
+            chunk = _warm(session, args.model, args.warm_timeout_s)
+            print(f"{args.model} answered in {chunk.rtt_s:.1f} s.", flush=True)
+        with BridgeServer(session, args.host, args.port) as server, suppress(KeyboardInterrupt):
+            print(f"Dream bridge listening on http://{args.host}:{server.server_port}", flush=True)
+            server.serve_forever()
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())

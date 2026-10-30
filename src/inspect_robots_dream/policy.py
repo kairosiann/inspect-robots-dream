@@ -1,251 +1,271 @@
-"""Inspect Robots policy ``dream``: Dream-1 driving the bimanual YAM through the local Dream bridge.
+"""The ``dream`` policy: Dream-1 driving a bimanual YAM.
 
-Dream's client keeps a window of camera frames (9 per camera, 0.2 s apart) built from every observation it is
-handed, so this policy sees every control step: ``act()`` returns one action at a time, forwards each observation
-to the bridge, and asks for a new chunk only when its queue runs out. That mirrors Dream's own simulated-YAM
-example (``dream_examples/yam_mujoco``):
-
-1. Pre-roll: hold the measured pose until the frame window is full (32 steps at 20 Hz).
-2. Ask for a chunk while the simulator waits (the rollout blocks in ``act()``), then play ``actions`` of its rows,
-   one per step, feeding every new observation. Repeat.
-
-Timestamps are the simulated clock (steps / control rate), so the window spacing matches what the model was
-trained on regardless of render speed. Each request passes the last row played as ``commanded``, so Dream's seam
-join takes over exactly where the arm is headed.
-
-The bridge runs in a separate venv (``python -m inspect_robots_dream.bridge``); this module needs only NumPy,
-OpenCV (Isaac Sim's) and the stdlib. Construction is inert; ``bind()`` checks the bridge is up.
+Dream's client builds its frame window (nine frames per camera, 0.2 s apart) from every tick it is
+handed, so the policy sees every control step: ``act()`` hands Dream that step's frames and joint
+state, returns one action, and asks for a new chunk only when the last one is used up. As in
+Dream's own simulated-YAM example, the arms hold still until the window is full, the rollout waits
+while Dream answers, and timestamps follow the control clock rather than wall time.
 """
 
 from __future__ import annotations
 
-import base64
-import json
-import urllib.error
-import urllib.request
+import atexit
+import math
 import warnings
 from collections import deque
-from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-from inspect_robots.policy import PolicyBase, PolicyConfig, PolicyInfo
-from inspect_robots.scene import Scene
-from inspect_robots.types import Action, ActionChunk, Observation
-from inspect_robots_yam.config import DEFAULT_CAMERAS, action_box, observation_space
-from inspect_robots_yam.packing import STATE_KEY
 
-from inspect_robots_dream import wire
-
-# (url, payload or None for GET, timeout_s) -> decoded JSON body. Raises BridgeUnavailable / RuntimeError.
-PostFn = Callable[[str, Mapping[str, Any] | None, float], Mapping[str, Any]]
-# RGB uint8 (H, W, 3) -> base64 JPEG at wire.FRAME_SIZE.
-EncodeFn = Callable[[np.ndarray], str]
-
-DEFAULT_SERVER = "http://127.0.0.1:8210"
-REMEDY = (
-    "start the Dream bridge in its own venv: "
-    "/data/dream/venv/bin/python -m inspect_robots_dream.bridge --warm"
+from inspect_robots import (
+    Action,
+    ActionChunk,
+    ActionSemantics,
+    Box,
+    CameraSpec,
+    EmbodimentInfo,
+    Observation,
+    ObservationSpace,
+    PolicyConfig,
+    PolicyInfo,
+    Scene,
 )
+from inspect_robots_dream import _station
+from inspect_robots_dream._station import Vector
+from inspect_robots_dream.bridge import BridgeSession
+from inspect_robots_dream.session import DEFAULT_MODEL, DreamSession, Episode, Session
+
+_JOINT_INDICES = [i for i in range(_station.DIM) if i not in _station.GRIPPERS]
 
 
-class BridgeUnavailable(ConnectionError):
-    """The bridge did not answer at all (not running, wrong port)."""
+@dataclass
+class _Trial:
+    instruction: str = ""
+    step: int = 0
+    queue: deque[Vector] = field(default_factory=deque)
+    hold: Vector | None = None
+    last: Vector | None = None
+    requests: list[dict[str, Any]] = field(default_factory=list)
+    tracking: list[float] = field(default_factory=list)
 
 
-def _default_post(  # pragma: no cover - real loopback transport, only against a live bridge
-    url: str, payload: Mapping[str, Any] | None, timeout_s: float
-) -> Mapping[str, Any]:
-    data = None if payload is None else json.dumps(payload).encode()
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            decoded: Mapping[str, Any] = json.loads(response.read())
-            return decoded
-    except urllib.error.HTTPError as error:
-        try:
-            body = json.loads(error.read())
-        except ValueError:
-            body = {}
-        raise RuntimeError(f"Dream bridge {error.code}: {body.get('message') or error.reason}") from None
-    except (urllib.error.URLError, ConnectionError) as error:
-        raise BridgeUnavailable(f"Dream bridge at {url} is not answering ({error}); {REMEDY}") from None
+class DreamPolicy:
+    """Dream-1 on a bimanual YAM, one action per control step.
 
-
-def _import_cv2() -> Any:  # pragma: no cover - Isaac Sim ships cv2; never install a second one into its env
-    import cv2
-
-    return cv2
-
-
-def encode_jpeg(rgb: np.ndarray, cv2: Any = None) -> str:
-    """One RGB frame as Dream wants it: resized to 320x176 (area filter), JPEG quality 85, base64 without prefix."""
-    cv2 = cv2 or _import_cv2()
-    width, height = wire.FRAME_SIZE
-    frame = np.asarray(rgb, dtype=np.uint8)
-    if frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError(f"expected an RGB (H, W, 3) frame, got shape {frame.shape}")
-    if frame.shape[:2] != (height, width):
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, wire.JPEG_QUALITY])
-    if not ok:
-        raise RuntimeError("JPEG encoding failed")
-    return base64.b64encode(np.asarray(buf).tobytes()).decode("ascii")
-
-
-def _int_arg(name: str, value: Any, low: int, high: int) -> int:
-    number = int(value)
-    if number != float(value) or not low <= number <= high:
-        raise ValueError(f"{name} must be an integer in {low}..{high}, got {value!r}")
-    return number
-
-
-class DreamPolicy(PolicyBase):
-    """Dream-1 on the bimanual YAM, one action per ``act()``, through the loopback bridge."""
+    The Dream client runs in this process unless ``server_url`` names an
+    ``inspect-robots-dream-bridge``, as it must under Isaac Sim. ``rows_per_request`` rows of each
+    48-row chunk play before Dream is asked again. ``dry_run`` asks Dream as usual but holds the
+    arms still, to inspect its replies before they move a robot.
+    """
 
     def __init__(
         self,
         *,
-        server_url: str = DEFAULT_SERVER,
-        actions: int = wire.MAX_ROWS,
-        warmup_steps: int | None = None,
-        timeout_s: float = 180.0,
-        post_fn: PostFn | None = None,
-        encode_fn: EncodeFn | None = None,
+        model: str = DEFAULT_MODEL,
+        server_url: str | None = None,
+        rows_per_request: int = _station.MAX_ROWS,
+        preroll_steps: int | None = None,
+        dry_run: bool = False,
+        record: bool = False,
+        timeout_s: float = 300.0,
+        session: Session | None = None,
     ) -> None:
-        # The rollout's connection-failure hint reads `server_url` and `remedy` off the policy (duck-typed).
-        self.server_url = str(server_url).rstrip("/")
-        self.remedy = REMEDY
-        self.actions = _int_arg("actions", actions, 1, wire.MAX_ROWS)
-        self._warmup_arg = None if warmup_steps is None else _int_arg("warmup_steps", warmup_steps, 0, 10_000)
-        self.timeout_s = float(timeout_s)
-        self._post: PostFn = post_fn or _default_post
-        self._encode: EncodeFn = encode_fn or encode_jpeg
-        self._loop_hz = wire.STATION_HZ
-        self._low: np.ndarray | None = None
-        self._high: np.ndarray | None = None
+        if not _is_count(rows_per_request) or not 1 <= rows_per_request <= _station.MAX_ROWS:
+            raise ValueError(
+                f"rows_per_request must be 1..{_station.MAX_ROWS}, got {rows_per_request!r}"
+            )
+        if preroll_steps is not None and not _is_count(preroll_steps):
+            raise ValueError(f"preroll_steps must be a whole number, got {preroll_steps!r}")
+        if not isinstance(dry_run, bool):
+            raise ValueError(f"dry_run must be true or false, got {dry_run!r}")
+        self.server_url = server_url
+        self.remedy = "run inspect-robots-dream-bridge in the Dream venv" if server_url else None
+        self.rows_per_request = rows_per_request
+        self.dry_run = dry_run
+        self._episode = Episode(model=model, record=record, timeout_s=timeout_s)
+        self._preroll_steps = preroll_steps
+        self._hz = _station.STATION_HZ
+        self._bounds: tuple[Vector, Vector] | None = None
+        self._session = session
+        self._owns_session = False
+        self._trial = _Trial()
         self.info = PolicyInfo(
             name="dream",
-            action_space=action_box(),
-            observation_space=observation_space(wire.FRAME_SIZE[1], wire.FRAME_SIZE[0], DEFAULT_CAMERAS),
-            # Dream's YAM station rate; compat warns when the embodiment runs at another one.
-            control_hz=wire.STATION_HZ,
+            action_space=Box(
+                shape=(_station.DIM,),
+                semantics=ActionSemantics(
+                    control_mode="joint_pos", gripper="continuous", dim_labels=_station.DIM_LABELS
+                ),
+            ),
+            observation_space=ObservationSpace(
+                cameras=tuple(
+                    CameraSpec(name, _station.FRAME_HEIGHT, _station.FRAME_WIDTH)
+                    for name in _station.CAMERAS
+                ),
+                state_keys=frozenset({_station.STATE_KEY}),
+            ),
+            control_hz=_station.STATION_HZ,
+            checkpoint=model,
         )
-        self.config = PolicyConfig(action_horizon=wire.MAX_ROWS, replan_interval=self.actions)
-        self._reset_trial_state()
-
-    # -- lifecycle -----------------------------------------------------------------------
-
-    def bind(self, embodiment_info: Any) -> None:
-        """Adopt the embodiment's rate and limits, and learn the bridge's model (fails fast if it is down)."""
-        hz = embodiment_info.control_hz
-        if hz:
-            self._loop_hz = float(hz)
-            if abs(self._loop_hz - wire.STATION_HZ) > 1e-6:
-                warnings.warn(
-                    f"Dream-1 rows are 30 Hz actions that Dream's YAM station plays at {wire.STATION_HZ:g} Hz; "
-                    f"this embodiment runs at {self._loop_hz:g} Hz, so motion plays at "
-                    f"{self._loop_hz / wire.DREAM_ROW_HZ:.2f}x the trained speed (pass -E control_hz=20)",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        box = embodiment_info.action_space
-        self._low = None if box.low is None else np.asarray(box.low, dtype=np.float64)
-        self._high = None if box.high is None else np.asarray(box.high, dtype=np.float64)
-        health = self._post(f"{self.server_url}/health", None, 10.0)
-        self.info = replace(self.info, checkpoint=str(health.get("model")))
-
-    def _reset_trial_state(self) -> None:
-        self._queue: deque[np.ndarray] = deque()
-        self._steps = 0
-        self._last_row: np.ndarray | None = None
-        self._calls: list[dict[str, Any]] = []
-        self._holds = 0
+        self.config = PolicyConfig()
 
     @property
-    def warmup_steps(self) -> int:
-        """Steps the pre-roll holds the pose: enough for a full frame window at the loop's rate."""
-        if self._warmup_arg is not None:
-            return self._warmup_arg
-        return (wire.OBS_WINDOW - 1) * max(1, round(self._loop_hz / wire.OBS_FPS))
+    def preroll_steps(self) -> int:
+        """Steps that hold the arms while Dream's frame window fills (32 at 20 Hz)."""
+        if self._preroll_steps is not None:
+            return self._preroll_steps
+        return math.ceil((_station.OBS_WINDOW - 1) * self._hz / _station.OBS_FPS)
+
+    def bind(self, embodiment_info: EmbodimentInfo) -> None:
+        """Accept only the bimanual YAM layout, adopt its rate, and check Dream can serve it."""
+        box, name = embodiment_info.action_space, embodiment_info.name
+        semantics = box.semantics
+        if (
+            box.shape != (_station.DIM,)
+            or semantics is None
+            or semantics.control_mode != "joint_pos"
+            or semantics.dim_labels not in (None, _station.DIM_LABELS)
+        ):
+            raise ValueError(
+                f"dream drives a bimanual YAM, {_station.DIM} absolute joint targets "
+                f"{', '.join(_station.DIM_LABELS)}; {name!r} declares {box.shape} {semantics}"
+            )
+        self._bounds = None
+        if box.low is not None and box.high is not None:
+            self._bounds = (np.asarray(box.low, np.float64), np.asarray(box.high, np.float64))
+        self._hz = embodiment_info.control_hz or _station.STATION_HZ
+        if self._hz != _station.STATION_HZ:
+            warnings.warn(
+                f"{name!r} runs at {self._hz:g} Hz; Dream's YAM station plays Dream-1's "
+                f"{_station.TRAINED_HZ:g} Hz rows at {_station.STATION_HZ:g} Hz "
+                "(yam_sim: -E control_hz=20)",
+                stacklevel=2,
+            )
+        aspect = _station.FRAME_WIDTH / _station.FRAME_HEIGHT
+        stretched = [
+            f"{camera.name} ({camera.width}x{camera.height})"
+            for camera in embodiment_info.observation_space.cameras
+            if camera.name in _station.CAMERAS and abs(camera.width / camera.height - aspect) > 0.05
+        ]
+        if stretched:
+            warnings.warn(
+                f"{name!r} cameras {', '.join(stretched)} will be stretched to Dream's "
+                f"{_station.FRAME_WIDTH}x{_station.FRAME_HEIGHT} frames "
+                "(yam_sim: -E cam_width=320 -E cam_height=176)",
+                stacklevel=2,
+            )
+        self._open_session().check(self._episode)
 
     def reset(self, scene: Scene) -> None:
-        """Start a Dream episode with the scene's instruction; the bridge empties the frame window."""
+        """Start a Dream episode with the scene's instruction as its prompt."""
         if not scene.instruction:
-            raise ValueError("the dream policy needs a language instruction")
-        self._reset_trial_state()
-        self._post(f"{self.server_url}/reset", {"prompt": scene.instruction, "action_hz": self._loop_hz}, 30.0)
-
-    # -- control -------------------------------------------------------------------------
+            raise ValueError("dream needs a scene instruction: Dream-1 is language-conditioned")
+        self._open_session().start(self._episode)
+        self._trial = _Trial(instruction=scene.instruction)
 
     def act(self, observation: Observation) -> ActionChunk:
-        """Feed this step's frames and state to Dream; return the next queued row (asking for a chunk if empty)."""
-        if STATE_KEY not in observation.state:
-            raise ValueError(f"observation missing state key {STATE_KEY!r}")
-        state = wire.as_state(observation.state[STATE_KEY])
-        frames = {}
-        for camera in wire.FRAME_KEYS:
-            image = observation.images.get(camera)
-            if image is None:
-                raise ValueError(f"observation missing camera {camera!r}")
-            frames[camera] = self._encode(image)
-        # The simulated clock, not render wall time: the window keeps one frame per 0.2 s of it.
-        timestamp = self._steps / self._loop_hz
-        self._post(
-            f"{self.server_url}/observe", {"frames": frames, "state": state.tolist(), "timestamp": timestamp}, 30.0
-        )
-        step = self._steps
-        self._steps += 1
-
-        if step < self.warmup_steps:
-            self._holds += 1
-            return ActionChunk(actions=[Action(data=state.copy(), meta={"dream": "warmup_hold"})], control_hz=self._loop_hz)
+        """Hand Dream this step; return the next row of its chunk, or the held pose meanwhile."""
+        trial = self._trial
+        if self._session is None or not trial.instruction:
+            raise RuntimeError("call reset(scene) before act()")
+        measured = _measured(observation)
+        if trial.hold is None:
+            trial.hold = measured
+        if trial.last is not None:
+            trial.tracking.append(float(np.abs(measured - trial.last)[_JOINT_INDICES].max()))
+        prompt = observation.instruction or trial.instruction
+        self._session.observe(_frames(observation), measured, prompt, trial.step / self._hz)
+        step = trial.step
+        trial.step += 1
+        if step < self.preroll_steps:
+            return self._chunk(trial.hold)
 
         latency = None
-        if not self._queue:
-            commanded = None if self._last_row is None else self._last_row.tolist()
-            reply = self._post(f"{self.server_url}/act", {"commanded": commanded}, self.timeout_s)
-            rows = wire.parse_chunks(reply)
-            latency = float(reply.get("rtt_s") or 0.0) or None
-            self._queue.extend(rows[: self.actions])
-            timing = reply.get("timing") or {}
-            self._calls.append(
+        if not trial.queue:
+            chunk = self._session.act(trial.last)
+            rows = chunk.rows[: self.rows_per_request]
+            trial.queue.extend(rows)
+            latency = chunk.rtt_s
+            trial.requests.append(
                 {
-                    "t": step,
-                    "rtt_s": latency,
-                    "serve_infer_ms": timing.get("serve_infer_ms"),
-                    "rows": int(rows.shape[0]),
-                    "played": min(self.actions, int(rows.shape[0])),
-                    "attempts": reply.get("attempts"),
-                    "out_of_range": wire.out_of_range(rows[: self.actions], self._low, self._high),
-                    "session_id": reply.get("session_id"),
+                    "step": step,
+                    "rtt_s": chunk.rtt_s,
+                    "infer_ms": chunk.infer_ms,
+                    "attempts": chunk.attempts,
+                    "rows": len(chunk.rows),
+                    "rows_beyond_limits": self._rows_beyond_limits(rows),
+                    "session_id": chunk.session_id,
                 }
             )
-        row = self._queue.popleft()
-        self._last_row = row
-        meta = {"dream": "chunk_row", "chunk": len(self._calls) - 1}
-        return ActionChunk(actions=[Action(data=row.copy(), meta=meta)], control_hz=self._loop_hz, inference_latency_s=latency)
+        row = trial.queue.popleft()
+        if self.dry_run:
+            return self._chunk(trial.hold, latency)
+        trial.last = row
+        return self._chunk(row, latency)
 
-    def transcript(self) -> Any | None:
-        """The trial's Dream calls (step, round trip, rows played, clamped entries) and the run settings."""
-        rtts = [c["rtt_s"] for c in self._calls if c["rtt_s"]]
+    def transcript(self) -> dict[str, Any]:
+        """This trial's Dream requests, and how closely the arms followed the rows sent."""
+        tracking = self._trial.tracking
         return {
-            "model": self.info.checkpoint,
-            "loop_hz": self._loop_hz,
-            "actions_per_chunk": self.actions,
-            "warmup_steps": self.warmup_steps,
-            "warmup_holds": self._holds,
-            "dream_calls": [dict(c) for c in self._calls],
-            "mean_rtt_s": (sum(rtts) / len(rtts)) if rtts else None,
-            "steps_seen": self._steps,
-            "sim_seconds": self._steps / self._loop_hz if self._loop_hz else None,
+            "model": self._episode.model,
+            "server_url": self.server_url,
+            "control_hz": self._hz,
+            "rows_per_request": self.rows_per_request,
+            "preroll_steps": self.preroll_steps,
+            "dry_run": self.dry_run,
+            "requests": [dict(request) for request in self._trial.requests],
+            "tracking_error_rad": (
+                {"mean": float(np.mean(tracking)), "max": max(tracking)} if tracking else None
+            ),
         }
 
+    def close(self) -> None:
+        """Release the Dream session; idempotent. A later reset opens a new one."""
+        atexit.unregister(self.close)
+        if self._session is not None:
+            self._session.close()
+        if self._owns_session:
+            self._session = None
+            self._owns_session = False
 
-def dream_policy(**kwargs: Any) -> DreamPolicy:
-    """Policy ``dream``: ``-P actions=N`` (rows per chunk, 1..48), ``-P server_url=...``, ``-P warmup_steps=N``."""
-    return DreamPolicy(**kwargs)
+    def __enter__(self) -> DreamPolicy:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _open_session(self) -> Session:
+        if self._session is None:
+            self._session = BridgeSession(self.server_url) if self.server_url else DreamSession()
+            self._owns_session = True
+            atexit.register(self.close)
+        return self._session
+
+    def _chunk(self, row: Vector, latency_s: float | None = None) -> ActionChunk:
+        return ActionChunk(
+            actions=[Action(data=row.copy())], control_hz=self._hz, inference_latency_s=latency_s
+        )
+
+    def _rows_beyond_limits(self, rows: Vector) -> int:
+        if self._bounds is None:
+            return 0
+        low, high = self._bounds
+        return int(((rows < low) | (rows > high)).any(axis=1).sum())
 
 
-__all__ = ["BridgeUnavailable", "DreamPolicy", "dream_policy", "encode_jpeg"]
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _measured(observation: Observation) -> Vector:
+    if _station.STATE_KEY not in observation.state:
+        raise ValueError(f"observation has no {_station.STATE_KEY!r} state")
+    return _station.vector(observation.state[_station.STATE_KEY])
+
+
+def _frames(observation: Observation) -> dict[str, str]:
+    missing = sorted(set(_station.CAMERAS) - set(observation.images))
+    if missing:
+        raise ValueError(f"observation has no image from {missing}")
+    return {camera: _station.jpeg(observation.images[camera]) for camera in _station.CAMERAS}
