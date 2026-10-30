@@ -1,71 +1,126 @@
 # inspect-robots-dream
 
-Run Dream Labs' Dream-1 on the bimanual YAM sim (`yam_sim`) in place of the `agent` (Claude Haiku) policy.
+Run Dream Labs' [Dream-1](https://dreamlabs.ai/research/dream-1/) on a bimanual YAM as an
+[Inspect Robots](https://github.com/robocurve/inspect-robots) policy, in simulation (`yam_sim`) or
+on the real arms (`yam_arms`), and evaluate it like any other policy. Not affiliated with Dream Labs.
 
-Dream's library needs NumPy 2 and websockets 17, and Isaac Sim 5.1 pins NumPy 1.26 and websockets 12. So Dream runs in its own venv as a small local bridge, and the `dream` policy in the Isaac env talks to it over `127.0.0.1:8210`.
+```bash
+inspect-robots run --embodiment yam_sim --policy dream -E control_hz=20 \
+  --instruction "put the red cube on the plate"
+```
+
+## How it works
+
+Every control step, the `dream` policy hands Dream the three camera frames and the 14 joint values,
+and plays Dream's 48-row chunks one row per step:
 
 ```text
-yam_sim (Isaac env) -> dream policy -> HTTP 127.0.0.1:8210 -> bridge (Dream venv) -> Dream-1 API
+embodiment ──frames + joints──▶ dream policy ──▶ Dream client ──▶ Dream-1 (hosted)
+     ▲                                                               │
+     └─────────────── one row per step ◀── 48-row chunk ◀────────────┘
 ```
 
-## Setup (once)
+- The arms hold still for the first 1.6 s, while Dream's window of nine frames per camera fills.
+- The rollout waits while Dream answers, so a slow request pauses the arms rather than skipping rows,
+  and each chunk takes over at its first row: the same seed plays the same trajectory however long
+  Dream takes to answer.
+- Requests use Dream's YAM station keys, as Dream's own simulated-YAM example does, so Dream computes
+  each hand's pose in the frame the model was trained in.
+- Rows play at the embodiment's control rate. Dream-1's rows are 30 Hz actions, and Dream's YAM
+  station plays them at 20 Hz, so run the embodiment at 20 Hz.
+- Each request passes the last row played, so Dream's seam smoothing blends into the new chunk from
+  where the arms are headed.
 
-Put your API key (https://platform.dreamlabs.ai/api-keys) on the instance:
+## Install
+
+Put your API key from [platform.dreamlabs.ai](https://platform.dreamlabs.ai/api-keys) where the
+Dream client looks for it:
+
 ```bash
-mkdir -p ~/.dreamlabs && echo 'DREAM_API_KEY=dl_live_...' > ~/.dreamlabs/credentials && chmod 600 ~/.dreamlabs/credentials
+mkdir -p ~/.dreamlabs && echo 'DREAM_API_KEY=dl_live_...' > ~/.dreamlabs/credentials
+chmod 600 ~/.dreamlabs/credentials
 ```
 
-Clone this repo onto the instance:
+Install the policy with the Dream client:
+
 ```bash
-git clone https://github.com/kairosiann/inspect-robots-dream /data/dream/inspect-robots-dream
+pip install "inspect-robots-dream[client] @ git+https://github.com/kairosiann/inspect-robots-dream"
 ```
 
-Create the Dream venv and install the bridge:
-```bash
-uv venv --python 3.11 /data/dream/venv
-uv pip install --python /data/dream/venv/bin/python dreamlabs
-uv pip install --python /data/dream/venv/bin/python --no-deps -e /data/dream/inspect-robots-dream
-```
+Under Isaac Sim, which pins websockets 12 while the Dream client needs 13 or newer, install the
+policy alone next to Isaac Sim and the client in its own venv:
 
-Install the policy next to the Isaac env, without touching its packages:
 ```bash
-uv pip install --python /data/env_isaaclab/bin/python --target /data/dream/isaac-overlay --no-deps /data/dream/inspect-robots-dream
+REPO="git+https://github.com/kairosiann/inspect-robots-dream"
+uv pip install --python /data/env_isaaclab/bin/python "inspect-robots-dream @ $REPO"
+uv venv --python 3.11 ~/dream-venv
+uv pip install --python ~/dream-venv/bin/python "inspect-robots-dream[client] @ $REPO"
 ```
 
 ## Run
 
-Start the bridge and leave it running (`--warm` waits while a stopped model starts):
 ```bash
-/data/dream/venv/bin/python -m inspect_robots_dream.bridge --warm --log /data/dream/logs/bridge-calls.jsonl
-```
-
-In another terminal, check that Dream answers, without moving the arms:
-```bash
-PYTHONPATH=/data/dream/isaac-overlay python -m inspect_robots_dream.check --out ~/dream-check
-```
-
-Let Dream-1 drive the arms:
-```bash
-PYTHONPATH=/data/dream/isaac-overlay inspect-robots run --embodiment yam_sim --policy dream \
+inspect-robots run --embodiment yam_sim --policy dream \
   -E control_hz=20 -E cam_width=320 -E cam_height=176 \
   --instruction "put the red cube on the plate" \
-  -E headless=false --max-steps 1600 --store-frames --log-dir ~/yam-eval/dream
-
+  --max-steps 1600 --store-frames --log-dir ~/yam-eval/dream
 inspect-robots view ~/yam-eval/dream
 ```
 
+Under Isaac Sim, start the bridge first and point the policy at it:
+
+```bash
+~/dream-venv/bin/inspect-robots-dream-bridge --warm
+inspect-robots run --embodiment yam_sim --policy dream -P server_url=http://127.0.0.1:8210 ...
+```
+
+`--warm` asks for one chunk before serving, because a model that is not running can take many
+minutes to start. The bridge listens on loopback and has no authentication. It serves one run at a
+time: if a second run starts on the same bridge, the first one stops with an error rather than
+sharing Dream's frame window.
+
+Before the embodiment starts, the policy checks that Dream can serve the model: a missing client, a
+bridge that is down, a refused key or an unknown model stops the run there.
+
+To check Dream's replies before they move real arms, add `-P dry_run=true`: Dream is asked as usual,
+the arms hold still, and each request is logged in the policy transcript.
+
 ## Options
 
-- `-P actions=N`: rows played per Dream chunk before asking again (1–48, default 48).
-- `-P warmup_steps=N`: steps that hold the pose before the first request (default 32: the 9-frame window at 20 Hz).
-- `-P server_url=http://127.0.0.1:8210`: where the bridge listens.
-- Bridge `--model dreamlabs/dream-1-beta-flash`: the faster model. `--record` stores episodes on your Dream account (off by default for sim).
+| `-P` option | Default | Meaning |
+|---|---|---|
+| `model` | `dreamlabs/dream-1-beta` | Checkpoint; `dreamlabs/dream-1-beta-flash` is the faster one |
+| `server_url` | none | Bridge URL; without it the Dream client runs in-process |
+| `rows_per_request` | `48` | Rows of each chunk played before asking again (1 to 48) |
+| `preroll_steps` | 32 at 20 Hz | Steps that hold still while the frame window fills |
+| `dry_run` | `false` | Ask Dream but hold the arms still |
+| `record` | `false` | Let the Dream client upload ticks to your Dream account |
+| `timeout_s` | `300` | Longest wait for one chunk, retries included |
 
-## Notes
+The policy accepts any embodiment with the bimanual YAM layout: 14 absolute joint targets
+(`left_j0` to `left_j5`, `left_gripper`, then the right arm), cameras `top_cam`, `left_cam` and
+`right_cam`, and state `joint_pos`. It warns when the control rate or camera shape differs from
+what Dream expects. Each trial's transcript lists every Dream request (round trip, inference time,
+retries, rows beyond the joint limits) and how closely the arms tracked the rows they were sent.
 
-- Requests use Dream's YAM station keys (`state.arm_l.joint_pos`, `image_window.top`, `robot.arm=yam` ...), as Dream's own sim example does, so the serve computes hand poses in its training frame.
-- Dream-1 rows are 30 Hz actions. Dream's YAM station plays them at 20 Hz, and so does this setup (`-E control_hz=20`).
-- The sim pauses while Dream answers. Each chunk takes about 0.3–0.5 s to infer, plus the network round trip.
-- `max-steps` counts sim steps at 20 Hz: 1600 steps is 80 s, including the 1.6 s pre-roll.
-- If the command doesn't return after it prints `log: ...`, press Ctrl+C: Isaac Sim can hang while closing, and the log is already saved.
-- Tests: `PYTHONPATH=src:tests /data/env_isaaclab/bin/python -m pytest tests`.
+## Status
+
+Dream-1 beta was run on `yam_sim` (Isaac Sim 5.1, L40S) on 2026-10-30 with a pre-release build that
+used the same request protocol. An 80 s trial made 33 requests of about 0.4 s each with no errors,
+and the arms tracked Dream's rows to within 0.03 rad. Dream reached the cube with the right arm and
+kept trying to grasp it, but did not lift it. `yam_sim`'s overhead camera sits lower and looks less
+steeply than the station camera Dream was trained with, which may matter.
+
+## Development
+
+```bash
+uv venv && uv pip install -e ".[dev]"
+ruff check . && ruff format --check . && mypy && pytest --cov
+```
+
+The tests run offline at 100% coverage: fakes stand in for Dream, a real loopback bridge carries
+bridged episodes, and the real Dream client runs with only its HTTP transport stubbed.
+
+## License
+
+[MIT](LICENSE)
